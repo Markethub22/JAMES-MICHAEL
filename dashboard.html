@@ -65,10 +65,15 @@ function mySchoolFee(){
 }
 
 function quickLinks(){
+  const _u = (typeof Auth!=="undefined") ? Auth.current() : null;
+  const _locked = _u && typeof shouldBlockForFees==="function" && shouldBlockForFees(_u);
+  const courseCard = _locked
+    ? `<div class="dash"><div class="icn">🔒</div><h3>Course Registration</h3><p>Locked — pay this semester's fee to unlock.</p><span class="status-pill status-fail">🔒 LOCKED</span></div>`
+    : `<div class="dash"><div class="icn">📚</div><h3>Course Registration</h3><p>Register courses for the session.</p><a href="courses.html">Open →</a></div>`;
   return `<section class="panel"><h2>Quick Links</h2>
     <div class="dash-grid">
       <div class="dash"><div class="icn">📝</div><h3>Bio Data</h3><p>Update / print your student profile.</p><a href="bio-data.html">Open →</a></div>
-      <div class="dash"><div class="icn">📚</div><h3>Course Registration</h3><p>Register courses for the session.</p><a href="courses.html">Open →</a></div>
+      ${courseCard}
       <div class="dash"><div class="icn">💰</div><h3>Fees & Invoices</h3><p>Pay invoices, print receipts.</p><a href="fees.html">Open →</a></div>
       <div class="dash"><div class="icn">🖼</div><h3>Gallery</h3><p>School photos & anthem.</p><a href="gallery.html">Open →</a></div>
     </div></section>
@@ -122,12 +127,12 @@ function renderPartTime(main, side){
   const acc = hasPaid(me.id,"acceptance");
   const info = paymentListFor(me);
   const _s = DB.settings; const _bio = DB.biodata[me.id]||{};
-  const semKey = info.isPerSemester
-    ? ("semester_fee_"+(_s.session||"").replace(/\W+/g,"_")+"_"+((_bio.semester||"HARMATTAN").toLowerCase()))
-    : "school_fee";
-  const sch = hasPaid(me.id, semKey);
-  const feeLabel = info.isPerSemester ? "Semester Fees" : "School Fees";
+  const _activeSem = (_s.currentSemester || _bio.semester || "HARMATTAN").toString();
+  const semKey = (typeof currentSemKeyFor==="function") ? currentSemKeyFor(me) : "school_fee";
+  const sch = (typeof isCurrentSemesterPaid==="function") ? isCurrentSemesterPaid(me) : hasPaid(me.id, semKey);
+  const feeLabel = semKey==="school_fee" ? "School Fees" : "Semester Fees";
   main.innerHTML = `
+    ${owingBannerHTML(me)}
     ${lateFeeNoticeHTML(me)}
     <section class="panel">
       <h2>Part-Time Student Portal</h2>
@@ -135,13 +140,9 @@ function renderPartTime(main, side){
       <div class="kv">
         <div class="item"><div class="k">Programme</div><div class="v">${me.course||"—"}</div></div>
         <div class="item"><div class="k">Mode</div><div class="v">Part-Time</div></div>
-        <div class="item"><div class="k">Session / Semester</div><div class="v">${_s.session||"—"} · ${(_bio.semester||"HARMATTAN").toUpperCase()}</div></div>
+        <div class="item"><div class="k">Session / Semester</div><div class="v">${_s.session||"—"} · ${_activeSem.toUpperCase()}</div></div>
         <div class="item"><div class="k">Acceptance Fee</div><div class="v">₦${acceptanceTotalFor(me).toLocaleString()} ${acc?paidPill():pendingPill()}</div></div>
         <div class="item" style="cursor:pointer" title="Click to view payment list" onclick="openSchoolFeePopup(Auth.current())"><div class="k">${feeLabel} ▸</div><div class="v">₦${info.total.toLocaleString()} ${sch?paidPill():pendingPill()}</div></div>
-      </div>
-      <div style="margin-top:8px;padding:10px 12px;background:#f5f9f6;border-left:3px solid #15532a;border-radius:6px;font-size:13px">
-        <strong>${feeLabel} breakdown:</strong>
-        ${info.fees.map(f=>`<div>• ${f[0]} — ₦${f[1].toLocaleString()}</div>`).join("")}
       </div>
       <div style="margin-top:18px;display:flex;gap:10px;flex-wrap:wrap">
         ${acc?'':payBtn('acceptance','Acceptance Fee')}
@@ -164,13 +165,13 @@ function renderPartTime(main, side){
 
     <section class="panel">
       <h2>Course Registration</h2>
-      ${sch
-        ? `<p>Register your courses for the current semester, then print your course form.</p>
+      ${(typeof shouldBlockForFees==="function" && shouldBlockForFees(me))
+        ? '<p class="sub" style="color:#b91c1c"><span class="status-pill status-fail">🔒 LOCKED</span> — Clear this semester\'s owing balance to unlock course registration.</p>'
+        : `<p>Register your courses for the current semester, then print your course form.</p>
            <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:10px">
              <a class="btn btn-green" href="courses.html">📚 Register Courses</a>
              <button class="btn btn-ghost" type="button" onclick="(function(){const r=(DB.registrations||[]).find(r=>r.userId===me.id&&r.session===DB.settings.session); if(!r){toast('Register your courses first.');return;} const cs=r.courseIds.map(id=>DB.courses.find(c=>c.id===id)).filter(Boolean); printCourseForm(me, cs);})()">🖨 Print Course Form</button>
-           </div>`
-        : '<p class="sub">Course registration unlocks once your School Fees payment is confirmed.</p>'}
+           </div>`}
     </section>
 
     <section class="panel"><h2>Payment History</h2>
@@ -261,19 +262,23 @@ function renderApplicant(main,side){
 function renderFresh(main,side){
   side.innerHTML = `<a class="active" href="#">Onboarding</a>`;
   const acc = hasPaid(me.id,"acceptance");
-  const sch = hasPaid(me.id,"school_fee");
+  const info = paymentListFor(me);
+  const semKey = (typeof currentSemKeyFor==="function") ? currentSemKeyFor(me) : "school_fee";
+  const sch = (typeof isCurrentSemesterPaid==="function") ? isCurrentSemesterPaid(me) : hasPaid(me.id, semKey);
+  const feeLabel = semKey==="school_fee" ? "School Fees" : "Semester Fees";
   main.innerHTML = `
+    ${owingBannerHTML(me)}
     ${lateFeeNoticeHTML(me)}
     <section class="panel">
       <h2>Pre-student Portal</h2>
       <div class="sub">Welcome ${me.name}. Complete onboarding to activate your matric number.</div>
       <div class="kv">
         <div class="item"><div class="k">Acceptance Fee</div><div class="v">₦${acceptanceTotalFor(me).toLocaleString()} ${acc?paidPill():pendingPill()}</div></div>
-        <div class="item" style="cursor:pointer" title="Click to view payment list" onclick="openSchoolFeePopup(Auth.current())"><div class="k">School Fees ▸</div><div class="v">₦${mySchoolFee().toLocaleString()} ${sch?paidPill():pendingPill()}</div></div>
+        <div class="item" style="cursor:pointer" title="Click to view payment list" onclick="openSchoolFeePopup(Auth.current())"><div class="k">${feeLabel} ▸</div><div class="v">₦${info.total.toLocaleString()} ${sch?paidPill():pendingPill()}</div></div>
       </div>
       <div style="margin-top:18px;display:flex;gap:10px;flex-wrap:wrap">
         ${acc?'':payBtn('acceptance','Acceptance Fee')}
-        ${acc&&!sch?payBtn('school_fee','School Fees'):''}
+        ${acc&&!sch?`<button class="btn btn-green" onclick="openSchoolFeePopup(Auth.current())">Pay ${feeLabel} (₦${info.total.toLocaleString()}) →</button>`:''}
         ${acc&&sch?'<span class="status-pill status-paid">All payments complete ✓</span>':''}
       </div>
     </section>
@@ -298,7 +303,7 @@ function renderFresh(main,side){
 }
 
 function renderReturning(main,side){
-  const tabs = ["dashboard","profile","checklist","fees"];
+  const tabs = ["dashboard","profile","checklist"];
   const active = (location.hash.replace("#","")||"dashboard");
   side.innerHTML = tabs.map(x=>`<a class="${x===active?"active":""}" href="#${x}" onclick="setTimeout(()=>render(),0)">${({dashboard:"🏠 Dashboard",profile:"👤 Profile",checklist:"✅ My Checklist",fees:"💰 School Fees"})[x]}</a>`).join("");
   if(active==="profile") return renderProfile(main);
@@ -346,7 +351,7 @@ window.updatePhoneEmail = ()=>{
 };
 function renderChecklist(main){
   const bio = DB.biodata[me.id]; const hasBio = bio && Object.keys(bio).length>3;
-  const sch = DB.invoices.some(i=>i.userId===me.id && /school fee/i.test(i.label) && i.status==="paid") || hasPaid(me.id,"school_fee");
+  const sch = (typeof isCurrentSemesterPaid==="function") ? isCurrentSemesterPaid(me) : (DB.invoices.some(i=>i.userId===me.id && /school fee/i.test(i.label) && i.status==="paid") || hasPaid(me.id,"school_fee"));
   const items = [
     {k:"Update Bio Data + Upload Passport",  d:hasBio, link:"bio-data.html"},
     {k:"Upload O'Level Result",       d:!!(bio&&bio.docOlevel), link:"bio-data.html"},
@@ -371,11 +376,11 @@ function renderChecklist(main){
     </section>`;
 }
 function renderManageCourses(main){
-  const sch = DB.invoices.some(i=>i.userId===me.id && /school fee/i.test(i.label) && i.status==="paid")
-           || hasPaid(me.id,"school_fee");
-  if(!sch){
+  const sch = (typeof isCurrentSemesterPaid==="function") ? isCurrentSemesterPaid(me) : (DB.invoices.some(i=>i.userId===me.id && /school fee/i.test(i.label) && i.status==="paid")
+           || hasPaid(me.id,"school_fee"));
+  if(typeof shouldBlockForFees==="function" && shouldBlockForFees(me)){
     main.innerHTML = `<section class="panel"><h2>Manage Courses</h2>
-      <p class="sub">Course registration is locked until you pay your <strong>School Fees</strong>.</p>
+      <p class="sub">Course registration is locked until you clear your <strong>owing balance</strong>.</p>
       <a class="btn btn-green" href="fees.html">Go to Fees →</a></section>`;
     return;
   }
@@ -415,13 +420,13 @@ function renderReturningHome(main){
   const photo = _resolveImg(bio.passport||me.profile?.passport);
   const info = paymentListFor(me);
   const _s = DB.settings;
-  const semKey = info.isPerSemester
-    ? ("semester_fee_"+(_s.session||"").replace(/\W+/g,"_")+"_"+((bio.semester||"HARMATTAN").toLowerCase()))
-    : "school_fee";
-  const sch = hasPaid(me.id, semKey);
-  const feeLabel = info.isPerSemester ? "Semester Fees" : "School Fees";
+  const _activeSem = (_s.currentSemester || bio.semester || "HARMATTAN").toString();
+  const semKey = (typeof currentSemKeyFor==="function") ? currentSemKeyFor(me) : "school_fee";
+  const sch = (typeof isCurrentSemesterPaid==="function") ? isCurrentSemesterPaid(me) : hasPaid(me.id, semKey);
+  const feeLabel = semKey==="school_fee" ? "School Fees" : "Semester Fees";
   const hasReg = (DB.registrations||[]).some(r=>r.userId===me.id && r.session===_s.session);
   main.innerHTML = `
+    ${owingBannerHTML(me)}
     ${lateFeeNoticeHTML(me)}
     <section class="panel">
       <h2>Welcome back, ${me.name.split(" ")[0]} 👋</h2>
@@ -434,7 +439,7 @@ function renderReturningHome(main){
       </div>
       <div class="kv" style="margin-top:14px">
         <div class="item"><div class="k">Session</div><div class="v">${_s.session}</div></div>
-        <div class="item"><div class="k">Semester</div><div class="v">${(bio.semester||"HARMATTAN").toUpperCase()}</div></div>
+        <div class="item"><div class="k">Semester</div><div class="v">${_activeSem.toUpperCase()}</div></div>
         <div class="item"><div class="k">${feeLabel}</div><div class="v">₦${info.total.toLocaleString()} ${sch?paidPill():pendingPill()}</div></div>
         <div class="item"><div class="k">Programme</div><div class="v">${/hnd/i.test(me.level||"")?"HND":"ND"}</div></div>
       </div>
@@ -453,12 +458,14 @@ function renderReturningHome(main){
 
     <section class="panel">
       <h2>Course Registration</h2>
-      <p>Pick your courses for <strong>${(bio.semester||"HARMATTAN").toUpperCase()}</strong> semester (${_s.session}), save, then print your course form.</p>
+      ${(typeof shouldBlockForFees==="function" && shouldBlockForFees(me)) ? `
+      <p class="sub" style="color:#b91c1c"><span class="status-pill status-fail">🔒 LOCKED</span> — Clear this semester's owing balance to unlock course registration and printing.</p>` : `
+      <p>Pick your courses for <strong>${_activeSem.toUpperCase()}</strong> semester (${_s.session}), save, then print your course form.</p>
       <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:10px">
         <a class="btn btn-green" href="courses.html">📚 Register / Update Courses</a>
         <button class="btn btn-ghost" type="button" onclick="(function(){const r=(DB.registrations||[]).find(r=>r.userId===me.id&&r.session===DB.settings.session); if(!r||!r.courseIds||!r.courseIds.length){toast('Register your courses first.');return;} const cs=r.courseIds.map(id=>DB.courses.find(c=>c.id===id)).filter(Boolean); printCourseForm(me, cs);})()">🖨 Print Course Form</button>
         ${hasReg?'<span class="status-pill status-paid">Courses registered ✓</span>':'<span class="status-pill status-pending">No courses registered yet</span>'}
-      </div>
+      </div>`}
     </section>
 
     <section class="panel">

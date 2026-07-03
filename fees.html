@@ -46,7 +46,9 @@ function render(){
     const amountCell = bundled ? "—" : ("₦"+ft.amount.toLocaleString());
     const actionCell = (function(){
       if(bundled) return '<span class="sub" style="color:#666">Included in School Fees</span>';
-      const fk = /acceptance/i.test(ft.name)?"acceptance":/school/i.test(ft.name)?"school_fee":null;
+      const isSchool = /school/i.test(ft.name);
+      const fk = /acceptance/i.test(ft.name)?"acceptance":isSchool?((typeof currentSemKeyFor==="function")?currentSemKeyFor(me):"school_fee"):null;
+      if(isSchool && typeof isCurrentSemesterPaid==="function" && isCurrentSemesterPaid(me)) return '<span class="status-pill status-paid">PAID</span>';
       if(fk && hasPaid(me.id,fk)) return '<span class="status-pill status-paid">PAID</span>';
       if(fk && hasPending(me.id,fk)) return '<span class="status-pill status-pending">PENDING</span>';
       // Enforce: late payment charge must be cleared before school fees
@@ -89,7 +91,7 @@ function payInvoice(id){
       return;
     }
   }
-  pay({ feeKey: /acceptance/i.test(inv.label)?"acceptance":isSchool?"school_fee":null,
+  pay({ feeKey: /acceptance/i.test(inv.label)?"acceptance":isSchool?((typeof currentSemKeyFor==="function")?currentSemKeyFor(me):"school_fee"):null,
         customAmount: inv.amount, customLabel: inv.label, invoiceId: inv.id,
         onSuccess: ()=>{ toast("Payment successful!"); render(); } });
 }

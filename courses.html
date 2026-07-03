@@ -37,9 +37,11 @@ const me = Auth.require();
 const gate = document.getElementById("gate");
 const wrap = document.getElementById("wrap");
 if(me){
-  // Course registration is UNLOCKED for all signed-in students
-  // (Full-Time, Part-Time and Returning). Admin uploads the courses; each
-  // student picks their courses and prints their Course Registration Form.
+  // HARD GATE: unpaid students see the owing banner and cannot open the list.
+  if(typeof shouldBlockForFees==="function" && shouldBlockForFees(me)){
+    gate.innerHTML = (typeof owingBannerHTML==="function" ? owingBannerHTML(me) : "")
+      + `<p style="margin-top:10px"><a class="btn btn-ghost" href="dashboard.html">← Back to Dashboard</a></p>`;
+  } else {
   gate.innerHTML = `<span class="status-pill status-paid">Open</span> &nbsp; Session ${DB.settings.session}`;
   wrap.style.display="block";
   const open = DB.courses.filter(c=>c.open);
@@ -63,6 +65,7 @@ if(me){
     if(!regs.length) return toast("Select at least one course first.");
     printCourseForm(me, regs);
   };
+  }
 }
 </script>
 </body></html>

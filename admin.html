@@ -24,6 +24,8 @@
   <a class="tab" data-tab="invoices" href="#">🧾 Invoices</a>
   <a class="tab" data-tab="payments" href="#">💸 Pending Payments</a>
   <a class="tab" data-tab="courses" href="#">📚 Course Management</a>
+  <a class="tab" data-tab="debtors" href="#">🚫 Debtors</a>
+  <a class="tab" data-tab="advance" href="#">⏭ Advance Semester</a>
   <a class="tab" data-tab="gallery" href="#">🖼 Gallery & Anthem</a>
   <a class="tab" data-tab="notices" href="#">📢 Notice Board</a>
   <a class="tab" data-tab="reports" href="#">📥 Reports / CSV</a>
@@ -65,6 +67,8 @@ function render(tab){
   if(tab==="notices") return renderNotices(m);
   if(tab==="reports") return renderReports(m);
   if(tab==="payments") return renderPayments(m);
+  if(tab==="debtors") return renderDebtors(m);
+  if(tab==="advance") return renderAdvance(m);
   if(tab==="settings") return renderSettings(m);
 }
 
@@ -312,7 +316,10 @@ function renderInvoices(m){
 }
 window.markPaid=(id)=>{const inv=DB.invoices;const x=inv.find(i=>i.id===id);x.status="paid";x.paidAt=Date.now();DB.invoices=inv;
   // also record a payment
-  const pays = DB.payments; pays.push({id:"p_"+Date.now(),userId:x.userId,feeKey:"manual",invoiceId:x.id,amount:x.amount,label:x.label,status:"paid",tx_ref:"MANUAL-"+Date.now(),date:Date.now()});DB.payments=pays;
+  const u = DB.users.find(z=>z.id===x.userId)||{};
+  const isSchool = /school\s*fee|semester\s*fee|exam\s*fee/i.test(x.label||"");
+  const feeKey = /acceptance/i.test(x.label||"") ? "acceptance" : isSchool ? (typeof currentSemKeyFor==="function" ? currentSemKeyFor(u) : "school_fee") : "manual";
+  const pays = DB.payments; pays.push({id:"p_"+Date.now(),userId:x.userId,feeKey,invoiceId:x.id,amount:x.amount,label:x.label,status:"paid",tx_ref:"MANUAL-"+Date.now(),date:Date.now(),sessionAtPay:(DB.settings||{}).session||null,semesterAtPay:((DB.settings||{}).currentSemester||"HARMATTAN").toUpperCase()});DB.payments=pays;
   render("invoices");};
 window.openInv=(id)=>{const i=DB.invoices.find(x=>x.id===id);if(i)printInvoice(i);};
 
@@ -474,7 +481,21 @@ function renderSettings(m){
     <div class="sub">School profile information shown on slips, receipts and admission letters. Changing the session year updates new matric numbers automatically (e.g. OCP/${startYear}/0001 → OCP/${startYear+1}/0001).</div>
     <form id="sf" style="display:grid;gap:10px;max-width:560px;margin-top:10px">
       <div><label>School Name</label><input name="schoolName" value="${s.schoolName||""}"/></div>
-      <div><label>Session Year</label><select name="session">${opts}</select></div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
+        <div><label>Session Year</label><select name="session">${opts}</select></div>
+        <div><label>Current Semester</label>
+          <select name="currentSemester">
+            <option value="HARMATTAN" ${(s.currentSemester||"HARMATTAN")==="HARMATTAN"?"selected":""}>Harmattan (1st Semester)</option>
+            <option value="RAIN" ${s.currentSemester==="RAIN"?"selected":""}>Rain (2nd Semester)</option>
+          </select>
+        </div>
+      </div>
+      <div style="background:#eefbf1;border:1px solid #bcdcc3;border-radius:8px;padding:10px 12px;font-size:13px;color:#15532a">
+        <strong>Semester control:</strong> Switching the semester re-opens the semester fee for every returning student
+        (Full-Time: Exam Fee only; Part-Time: Tuition + Exam Fee). Payments already made stay tagged to the previous semester
+        and remain in Payment History. Click <em>Open New Semester</em> below to flip to the next semester in one click.
+        <div style="margin-top:8px"><button type="button" class="btn btn-green" id="btnOpenNewSem" style="padding:6px 12px">Open New Semester</button></div>
+      </div>
       <div><label>Address</label><input name="address" value="${s.address||""}"/></div>
       <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
         <div><label>Phone</label><input name="phone" value="${s.phone||""}"/></div>
@@ -526,11 +547,126 @@ function renderSettings(m){
       messages[k] = (d["msg_"+k]||"").trim();
       delete d["msg_"+k];
     });
-    DB.settings={...DB.settings,...d, bank, messages};
+    const oldSession = DB.settings.session;
+    const oldSemester = (DB.settings.currentSemester||"HARMATTAN").toUpperCase();
+    DB.settings={...DB.settings,...d, currentSemester:(d.currentSemester||"HARMATTAN").toUpperCase(), bank, messages};
+    const newSemester = (DB.settings.currentSemester||"HARMATTAN").toUpperCase();
+    if((oldSession!==DB.settings.session || oldSemester!==newSemester) && typeof _snapshotDebtorsForRollover==="function"){
+      _snapshotDebtorsForRollover(oldSession, oldSemester);
+      DB.settings = {...DB.settings, previousSession: oldSession, previousSemester: oldSemester, semesterOpenedAt: Date.now(), semesterDebtLockActive: true};
+    }
     toast("Settings saved."); render("settings");
   };
+  const btnNS = document.getElementById("btnOpenNewSem");
+  if(btnNS){
+    btnNS.onclick = ()=>{
+      const cur = (DB.settings.currentSemester || "HARMATTAN").toUpperCase();
+      const next = cur==="HARMATTAN" ? "RAIN" : "HARMATTAN";
+      const label = next==="HARMATTAN" ? "Harmattan (1st Semester)" : "Rain (2nd Semester)";
+      if(!confirm("Open "+label+" for all returning students?\n\nThis will re-open the semester fee (FT: Exam only, PT: Tuition + Exam) for every returning student. Previous semester payments stay in Payment History.")) return;
+      const oldSession = DB.settings.session;
+      if(typeof _snapshotDebtorsForRollover==="function") _snapshotDebtorsForRollover(oldSession, cur);
+      DB.settings = {...DB.settings, currentSemester: next, previousSession: oldSession, previousSemester: cur, semesterOpenedAt: Date.now(), semesterDebtLockActive: true};
+      toast("New semester opened: "+label);
+      render("settings");
+    };
+  }
 }
 
+
+function renderDebtors(m){
+  const f = window.__debtorFilters || { mode:"all", role:"all", session:"all", semester:"all", status:"owing", q:"" };
+  const rows = getDebtors(f);
+  const totalOwed = rows.filter(r=>r.status==="owing").reduce((s,r)=>s+(r.amount||0),0);
+  const sessions = Array.from(new Set((DB.debtorsLedger||[]).map(x=>x.session).concat([DB.settings.session]))).filter(Boolean);
+  const opt = (v,l,cur)=>`<option value="${v}" ${cur===v?"selected":""}>${l}</option>`;
+  m.innerHTML = `<section class="panel">
+    <h2>🚫 Debtors</h2>
+    <div class="sub">Students who have not paid a session/semester fee. Current-semester debtors are shown in real time. Historic debt (from previous semesters that were rolled over) can be settled with <em>Mark Paid</em>.</div>
+    <div style="display:grid;grid-template-columns:repeat(6,minmax(120px,1fr));gap:8px;margin:14px 0">
+      <select id="fMode">${opt("all","All Modes",f.mode)}${opt("Full-Time","Full-Time",f.mode)}${opt("Part-Time","Part-Time",f.mode)}</select>
+      <select id="fRole">${opt("all","All Roles",f.role)}${opt("fresh","Fresh (FT/PT)",f.role)}${opt("returning","Returning",f.role)}</select>
+      <select id="fSession">${opt("all","All Sessions",f.session)}${sessions.map(s=>opt(s,s,f.session)).join("")}</select>
+      <select id="fSemester">${opt("all","All Semesters",f.semester)}${opt("HARMATTAN","Harmattan",f.semester)}${opt("RAIN","Rain",f.semester)}</select>
+      <select id="fStatus">${opt("all","All",f.status)}${opt("owing","Owing",f.status)}${opt("paid","Paid",f.status)}</select>
+      <input id="fQ" placeholder="Search name / matric / email" value="${(f.q||"").replace(/"/g,"&quot;")}"/>
+    </div>
+    <div style="display:flex;gap:10px;align-items:center;margin-bottom:10px;flex-wrap:wrap">
+      <strong style="color:#b91c1c">Total Owed (filtered): ₦${totalOwed.toLocaleString()}</strong>
+      <span style="color:#666">·</span>
+      <span>${rows.length} record${rows.length===1?"":"s"}</span>
+      <button class="btn btn-ghost" id="debCSV" style="margin-left:auto">⬇ Export CSV</button>
+    </div>
+    <table class="tbl"><thead><tr>
+      <th>Name</th><th>Matric</th><th>Mode</th><th>Course</th><th>Level</th>
+      <th>Session</th><th>Semester</th><th>Amount</th><th>Status</th><th></th>
+    </tr></thead><tbody>
+      ${rows.length ? rows.map(r=>`<tr>
+        <td>${r.name||"—"}</td>
+        <td style="font-family:monospace;font-size:12px">${r.matric||"—"}</td>
+        <td>${r.mode||"—"}</td>
+        <td>${r.course||"—"}</td>
+        <td>${r.level||"—"}</td>
+        <td>${r.session||"—"}</td>
+        <td>${r.semester||"—"}</td>
+        <td>₦${(r.amount||0).toLocaleString()}</td>
+        <td>${pill(r.status)}</td>
+        <td>${r.status==="owing" && !r.live
+          ? `<button class="btn btn-green" style="padding:4px 10px;font-size:12px" onclick="markDebtorPaid('${r.id}');toast('Marked paid');render('debtors')">Mark Paid</button>`
+          : (r.live ? '<span class="sub" style="font-size:11px;color:#888">live</span>' : '')}</td>
+      </tr>`).join("")
+      : '<tr><td colspan="10" style="text-align:center;padding:24px;color:var(--muted)">No debtors match these filters. 🎉</td></tr>'}
+    </tbody></table>
+  </section>`;
+  const bind = (id,key)=>{ const el=document.getElementById(id); if(!el) return; el.onchange = ()=>{ window.__debtorFilters = {...(window.__debtorFilters||f), [key]: el.value }; render("debtors"); }; };
+  bind("fMode","mode"); bind("fRole","role"); bind("fSession","session"); bind("fSemester","semester"); bind("fStatus","status");
+  const q = document.getElementById("fQ");
+  if(q){ q.oninput = ()=>{ window.__debtorFilters = {...(window.__debtorFilters||f), q: q.value }; }; q.onchange = ()=>render("debtors"); }
+  const csv = document.getElementById("debCSV");
+  if(csv){ csv.onclick = ()=>{
+    const header = ["Name","Matric","Email","Mode","Role","Course","Level","Session","Semester","Amount","Status"];
+    const lines = [header.join(",")].concat(rows.map(r=>[r.name,r.matric,r.email,r.mode,r.role,r.course,r.level,r.session,r.semester,r.amount,r.status].map(v=>`"${(v==null?"":String(v)).replace(/"/g,'""')}"`).join(",")));
+    const blob = new Blob([lines.join("\n")], {type:"text/csv"});
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a"); a.href=url; a.download="debtors.csv"; a.click();
+    setTimeout(()=>URL.revokeObjectURL(url), 1500);
+  }; }
+}
+
+function renderAdvance(m){
+  const s = DB.settings || {};
+  const cur = { session: s.session, semester: (s.currentSemester||"HARMATTAN").toUpperCase() };
+  const next = cur.semester==="HARMATTAN"
+    ? { session: cur.session, semester: "RAIN" }
+    : (function(){ const mm = /^(\d{4})\/(\d{4})$/.exec(cur.session||""); return { session: mm ? (parseInt(mm[1],10)+1)+"/"+(parseInt(mm[2],10)+1) : cur.session, semester: "HARMATTAN" }; })();
+  const debtors = getDebtors({status:"owing", session: cur.session, semester: cur.semester});
+  const totalFrozen = debtors.reduce((a,r)=>a+(r.amount||0), 0);
+  m.innerHTML = `<section class="panel">
+    <h2>⏭ Advance Semester</h2>
+    <div class="sub">Snapshot every unpaid student into the Debtors Ledger, then flip the current semester forward. Nothing is deleted — debt survives the rollover and continues to block course registration for the affected students until they pay.</div>
+    <div class="kv" style="margin-top:14px">
+      <div class="item"><div class="k">Current</div><div class="v">${cur.session} · ${cur.semester}</div></div>
+      <div class="item"><div class="k">Next</div><div class="v">${next.session} · ${next.semester}</div></div>
+      <div class="item"><div class="k">Unpaid Students</div><div class="v">${debtors.length}</div></div>
+      <div class="item"><div class="k">₦ Frozen as Debt</div><div class="v" style="color:#b91c1c">₦${totalFrozen.toLocaleString()}</div></div>
+    </div>
+    ${debtors.length ? `
+    <h3 style="margin:18px 0 6px;font-size:15px">Will be snapshotted (${debtors.length}):</h3>
+    <table class="tbl"><thead><tr><th>Name</th><th>Matric</th><th>Mode</th><th>Course</th><th>Level</th><th>Amount</th></tr></thead>
+    <tbody>${debtors.map(r=>`<tr><td>${r.name}</td><td style="font-family:monospace;font-size:12px">${r.matric||"—"}</td><td>${r.mode}</td><td>${r.course||"—"}</td><td>${r.level||"—"}</td><td>₦${(r.amount||0).toLocaleString()}</td></tr>`).join("")}</tbody></table>
+    ` : '<p class="sub" style="margin-top:14px">No unpaid students. Rollover will simply flip the semester.</p>'}
+    <div style="margin-top:18px;display:flex;gap:10px;flex-wrap:wrap">
+      <button class="btn btn-green" id="btnAdv">⏭ Snapshot debtors &amp; advance to ${next.semester}</button>
+      <a class="btn btn-ghost" href="#" onclick="document.querySelector('.tab[data-tab=debtors]').click();return false;">🚫 View Debtors Ledger</a>
+    </div>
+  </section>`;
+  document.getElementById("btnAdv").onclick = ()=>{
+    if(!confirm(`Advance from ${cur.session} · ${cur.semester} to ${next.session} · ${next.semester}?\n\n${debtors.length} student(s) will be snapshotted into the Debtors Ledger owing ₦${totalFrozen.toLocaleString()} in total. They will remain BLOCKED from course registration until they pay.`)) return;
+    const r = advanceSemester();
+    toast(`Advanced → ${r.to.session} · ${r.to.semester} (${r.added} debtor${r.added===1?"":"s"} snapshotted)`);
+    render("advance");
+  };
+}
 
 // Self-heal: make sure EVERY admitted applicant has their own student account.
 // This repairs older data where two applicants were merged into one student.

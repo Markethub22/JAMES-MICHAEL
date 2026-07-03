@@ -307,6 +307,7 @@ const DB = {
   _anthem:   _store("ocp_anthem", null),
   _settings: _store("ocp_settings", {
     session: "2026/2027",
+    currentSemester: "HARMATTAN",
     schoolName: SCHOOL.name, rc: SCHOOL.rc,
     address: SCHOOL.address, phone: SCHOOL.phone,
     email: SCHOOL.email, bursaryEmail: SCHOOL.bursaryEmail,
@@ -318,6 +319,7 @@ const DB = {
     admissionStart: "", admissionEnd: "",
   }),
   _pwdResets:_store("ocp_pwd_resets", []),
+  _debtors:  _store("ocp_debtors_ledger", []),
 
   get users(){ return this._users.get(); }, set users(v){ this._users.set(v); },
   get payments(){ return this._pays.get(); }, set payments(v){ this._pays.set(v); },
@@ -333,6 +335,7 @@ const DB = {
   get anthem(){ return this._anthem.get(); }, set anthem(v){ this._anthem.set(v); },
   get settings(){ return this._settings.get(); }, set settings(v){ this._settings.set(v); },
   get pwdResets(){ return this._pwdResets.get(); }, set pwdResets(v){ this._pwdResets.set(v); },
+  get debtorsLedger(){ return this._debtors.get(); }, set debtorsLedger(v){ this._debtors.set(v); },
 };
 
 // Ensure new settings keys exist when older saved settings are loaded
@@ -345,7 +348,12 @@ const DB = {
   if(!s.tuition){ s.tuition = DEFAULT_TUITION; changed = true; }
   if(!s.messages){ s.messages = {}; changed = true; }
   if(typeof s.admissionStart === "undefined"){ s.admissionStart = ""; changed = true; }
+  if(typeof s.admissionStart === "undefined"){ s.admissionStart = ""; changed = true; }
   if(typeof s.admissionEnd === "undefined"){ s.admissionEnd = ""; changed = true; }
+  if(!s.currentSemester){ s.currentSemester = "HARMATTAN"; changed = true; }
+  // Start with students unlocked. Debtor blocking only begins after the admin
+  // explicitly changes/open a semester, per school workflow.
+  if(typeof s.semesterDebtLockActive === "undefined"){ s.semesterDebtLockActive = false; changed = true; }
   if(changed) DB.settings = s;
 })();
 
@@ -754,6 +762,71 @@ function _findExistingPayment(userId, feeKey){
   );
 }
 
+function _normSession(v){ return (v||"").toString().replace(/\W+/g,"_"); }
+function _normSemester(v){ return (v||"HARMATTAN").toString().trim().toUpperCase(); }
+function _semesterFeeKey(session, semester){ return "semester_fee_"+_normSession(session)+"_"+_normSemester(semester).toLowerCase(); }
+function _currentSession(){ return (DB.settings||{}).session || SCHOOL.session || ""; }
+function _currentSemester(user){
+  const bio = user && (DB.biodata||{})[user.id] || {};
+  return _normSemester((DB.settings||{}).currentSemester || bio.semester || "HARMATTAN");
+}
+function _isSchoolPaymentLike(p){
+  const key = (p && p.feeKey || "").toString();
+  const label = (p && p.label || "").toString();
+  return key==="school_fee" || /^semester_fee_/.test(key) || /school\s*fee|semester\s*fee|exam\s*fee/i.test(label);
+}
+function _isInitialSchoolFeePayment(p){
+  const key = (p && p.feeKey || "").toString();
+  const label = (p && p.label || "").toString();
+  return key==="school_fee" || /school\s*fees?/i.test(label);
+}
+function _paymentPeriodMatches(p, session, semester){
+  if(!p || p.status!=="paid") return false;
+  const ps = _normSession(p.sessionAtPay || p.session || "");
+  const pm = _normSemester(p.semesterAtPay || p.semester || "");
+  return !!ps && ps===_normSession(session) && pm===_normSemester(semester);
+}
+function _hasPaidForCurrentPeriod(user){
+  if(!user) return false;
+  const session = _currentSession();
+  const semester = _currentSemester(user);
+  const semKey = _semesterFeeKey(session, semester);
+  const openedAt = (DB.settings||{}).semesterOpenedAt || 0;
+  return (DB.payments||[]).some(p =>
+    p.userId===user.id && p.status==="paid" &&
+    (
+      p.feeKey===semKey ||
+      (_isSchoolPaymentLike(p) && _paymentPeriodMatches(p, session, semester)) ||
+      // Legacy / missing period stamp: if no semester rollover has occurred
+      // (or the payment was made after the most recent rollover), the payment
+      // still covers the current period.
+      (_isSchoolPaymentLike(p) && (!openedAt || (p.confirmedAt || p.paidAt || p.date || 0) >= openedAt))
+    )
+  );
+}
+function _schoolFeeBundleCoversCurrent(user){
+  if(!user) return false;
+  const session = _currentSession();
+  const semester = _currentSemester(user);
+  const openedAt = (DB.settings||{}).semesterOpenedAt || 0;
+  return (DB.payments||[]).some(p =>
+    p.userId===user.id && _isInitialSchoolFeePayment(p) && p.status==="paid" &&
+    (
+      _paymentPeriodMatches(p, session, semester) ||
+      // The initial "school_fee" bundle a fresh student pays covers the
+      // ENTIRE session (both HARMATTAN and RAIN). So as long as the payment
+      // was stamped with the current session, the student is still covered
+      // even after the admin flips HARMATTAN -> RAIN within the same session.
+      (_normSession(p.sessionAtPay||"") && _normSession(p.sessionAtPay||"")===_normSession(session)) ||
+      // Legacy fallback: if the admin hasn't rolled the semester (no
+      // semesterOpenedAt), or this payment was made in/after the current
+      // period, the initial school-fee bundle still covers the current period.
+      !openedAt ||
+      (p.confirmedAt || p.paidAt || p.date || 0) >= openedAt
+    )
+  );
+}
+
 function userPayments(userId){ return DB.payments.filter(p=>p.userId===userId); }
 function hasPaid(userId, feeKey){ return userPayments(userId).some(p=>p.feeKey===feeKey && p.status==="paid"); }
 function hasPending(userId, feeKey){ return userPayments(userId).some(p=>p.feeKey===feeKey && p.status==="pending"); }
@@ -852,6 +925,9 @@ function _openBankPayModal({fee, feeKey, invoiceId, name, email, existing, onSuc
       payerName: f.payerName.value, payerPhone: f.payerPhone.value,
       proofKey,
       method: "Bank Transfer",
+      sessionAtPay: (DB.settings||{}).session || null,
+      semesterAtPay: ((DB.settings||{}).currentSemester || "HARMATTAN").toUpperCase(),
+      periodLocked: true,
     };
     if(!existing){ _recordPayment(rec); }
     else { // update existing pending with new proof / payer
@@ -984,7 +1060,8 @@ function _normKey(k){
   if(/first|given/.test(k)) return "firstname";
   if(/surname|last/.test(k)) return "surname";
 
-  if(/course|program/.test(k)) return "course";
+  if(/course|program(?!me\s*type)/.test(k)) return "course";
+  if(/^mode$|study\s*mode|programme\s*type|program\s*type|^type$|ft\s*\/?\s*pt|pt\s*\/?\s*ft/.test(k)) return "mode";
   return k;
 }
 function _normaliseRow(r){ const o={}; Object.keys(r).forEach(k=> o[_normKey(k)] = r[k]); return o; }
@@ -1011,15 +1088,22 @@ async function bulkImportOldStudents(file){
     const pwd = firstName || "student";
     const email = r.email || `${matricU.replace(/[^a-z0-9]/gi,"").toLowerCase()}@ocpotech.edu.ng`;
     try{
+      const modeRaw = (r.mode||"").toString().trim();
+      let modeVal;
+      if(/part|^pt$|p\s*\/?\s*t/i.test(modeRaw)) modeVal = "Part-Time";
+      else if(/full|^ft$|f\s*\/?\s*t/i.test(modeRaw)) modeVal = "Full-Time";
+      else if(/\bPT\b/i.test(matricU) || /^PT[-\s]/i.test(r.level||"")) modeVal = "Part-Time";
+      else modeVal = "Full-Time";
       users.push({
         id:"u_"+Date.now()+"_"+added, name: r.name, email,
         password: await hashPassword(pwd),
         role: "returning", matric: r.matric,
         course: r.course || r.department || "",
         level: r.level || "ND II",
+        mode: modeVal,
         createdAt: Date.now(), status: "active",
         mustChangePwd: true, registered: true,
-        profile: { phone: r.phone||"", department: r.department||"", tempPassword: pwd }
+        profile: { phone: r.phone||"", department: r.department||"", tempPassword: pwd, mode: modeVal }
       });
 
       added++;
@@ -1330,14 +1414,16 @@ function paymentListFor(user){
   }
 
   // Detect whether the student has ALREADY completed the first school-fee
-  // payment. After the first payment, subsequent semesters show a reduced
-  // "per-semester" list only:
+  // payment. That first bundle covers the session/semester where it was paid.
+  // Only AFTER admin moves to another semester/session does a fresh student
+  // switch to the reduced "per-semester" list:
   //   - PART-TIME: TUITION + EXAM FEE
   //   - FULL-TIME: EXAM FEE only
-  const firstPaid = (typeof hasPaid === "function") && hasPaid(user.id, "school_fee");
+  const firstPaid = (DB.payments||[]).some(p=>p.userId===user.id && p.status==="paid" && _isInitialSchoolFeePayment(p));
+  const firstBundleCoversNow = (typeof _schoolFeeBundleCoversCurrent === "function") && _schoolFeeBundleCoversCurrent(user);
   // Returning students never see the full fresh-student payment list — they only
   // pay per-semester fees (Tuition+Exam for PT, Exam only for FT).
-  const isReturning = (user.role === "returning") || firstPaid;
+  const isReturning = (user.role === "returning") || (firstPaid && !firstBundleCoversNow);
   let fees, isPerSemester = false;
   if(isReturning){
     isPerSemester = true;
@@ -1366,7 +1452,7 @@ function paymentListFor(user){
   }
   // Late payment charge lives OUTSIDE the school-fee list. It is offered as
   // a separate payment the student can settle before/alongside school fees.
-  // Rule: ₦10,000 if it has been more than 10 days (1 week + 3 days) since
+  // Rule: ₦15,000 if it has been more than 30 days since
   // the acceptance fee was paid AND school fees are still outstanding.
   // Once the school fee is paid, the charge disappears from the list — but any
   // late-charge payment already made stays in Payment History.
@@ -1375,22 +1461,26 @@ function paymentListFor(user){
   let lateDeadline = 0;
   let daysLeft = 0;
   try{
+    // Late-payment 30-day timer runs from the acceptance-fee date. It is
+    // independent of the semester debt-lock so the notice/charge always
+    // shows up for students who still owe school fees.
     if(!firstPaid){
       const accPay = (DB.payments||[]).find(p=>p.userId===user.id && p.feeKey==="acceptance" && p.status==="paid");
       if(accPay){
         const anchor = accPay.confirmedAt || accPay.paidAt || accPay.date || accPay.at || 0;
         if(anchor){
           acceptancePaidAt = anchor;
-          lateDeadline = anchor + 10*86400000;
+          lateDeadline = anchor + 30*86400000;
           const days = (Date.now() - anchor) / 86400000;
-          daysLeft = Math.max(0, Math.ceil(10 - days));
-          if(days > 10) lateCharge = 10000;
+          daysLeft = Math.max(0, Math.ceil(30 - days));
+          if(days > 30) lateCharge = 15000;
         }
       }
     }
   }catch(_){}
   const total = fees.reduce((a,r)=>a+r[1],0);
-  return { fees, total, session, bank, course, tuition, isIndigene, bio, isPerSemester, lateCharge, acceptancePaidAt, lateDeadline, daysLeft };
+  const activeSemester = (s.currentSemester || bio.semester || "HARMATTAN").toString().toUpperCase();
+  return { fees, total, session, bank, course, tuition, isIndigene, bio, isPerSemester, lateCharge, acceptancePaidAt, lateDeadline, daysLeft, activeSemester };
 }
 
 // Total of the payment list = the amount shown for "School Fees".
@@ -1399,26 +1489,23 @@ function schoolFeeTotal(user){
 }
 
 // Notice banner shown on student dashboards so they know about the 10-day
-// grace period before the ₦10,000 late payment charge locks school fees.
+// grace period before the ₦15,000 late payment charge locks school fees.
 function lateFeeNoticeHTML(user){
   try{
     user = user || (typeof Auth!=="undefined" && Auth.current()) || {};
     const info = paymentListFor(user);
     if(!info || !info.acceptancePaidAt) return "";
-    const payLabel = info.isPerSemester ? "Semester Fees" : "School Fees";
+    const semKey = (typeof currentSemKeyFor==="function") ? currentSemKeyFor(user) : "school_fee";
+    const payLabel = semKey==="school_fee" ? "School Fees" : "Semester Fees";
     // If already paid school fees, no notice needed.
-    const s = DB.settings || {}; const bio = DB.biodata[user.id] || {};
-    const semKey = info.isPerSemester
-      ? ("semester_fee_"+(s.session||"").replace(/\W+/g,"_")+"_"+((bio.semester||"HARMATTAN").toLowerCase()))
-      : "school_fee";
-    if(typeof hasPaid==="function" && hasPaid(user.id, semKey)) return "";
+    if(typeof isCurrentSemesterPaid==="function" ? isCurrentSemesterPaid(user) : (typeof hasPaid==="function" && hasPaid(user.id, semKey))) return "";
     if(info.lateCharge > 0){
       const latePaid = typeof hasPaid==="function" && hasPaid(user.id, "late_payment_charge");
       return `<section class="panel" style="border:1px solid #f5c26b;background:#fff8e6">
         <h3 style="margin:0 0 6px;color:#8a5a00">⚠ Late Payment Charge Applied</h3>
         <p class="sub" style="color:#8a5a00;margin:0">
           Your 10-day window to pay ${payLabel.toLowerCase()} has expired. A
-          <strong>₦10,000 late payment charge</strong> has been added and your
+          <strong>₦15,000 late payment charge</strong> has been added and your
           ${payLabel.toLowerCase()} button is <strong>locked</strong> until this charge is cleared.
           ${latePaid?'<br/><strong>Late charge paid ✓ — you can now pay your '+payLabel.toLowerCase()+'.</strong>':''}
         </p>
@@ -1429,7 +1516,7 @@ function lateFeeNoticeHTML(user){
       <p class="sub" style="color:#15532a;margin:0">
         You have <strong>${info.daysLeft} day${info.daysLeft===1?'':'s'}</strong> left to pay your ${payLabel.toLowerCase()}
         (deadline: <strong>${new Date(info.lateDeadline).toLocaleDateString()}</strong>).
-        If not paid by then, a <strong>₦10,000 late payment charge</strong> will be added and your
+        If not paid by then, a <strong>₦15,000 late payment charge</strong> will be added and your
         ${payLabel.toLowerCase()} button will be <strong>locked</strong> until the charge is cleared.
       </p>
     </section>`;
@@ -1441,21 +1528,17 @@ function lateFeeNoticeHTML(user){
 // with a Pay button. Used when the student clicks the School Fees card.
 function openSchoolFeePopup(user){
   user = user || (typeof Auth!=="undefined" && Auth.current()) || {};
-  const { fees, total, bank, isPerSemester, lateCharge, lateDeadline, daysLeft } = paymentListFor(user);
+  const { fees, total, bank, lateCharge, lateDeadline, daysLeft } = paymentListFor(user);
   const lateFeeKey = "late_payment_charge";
   const latePaid = lateCharge>0 && (typeof hasPaid==="function") && hasPaid(user.id, lateFeeKey);
   const latePending = lateCharge>0 && (typeof hasPending==="function") && hasPending(user.id, lateFeeKey);
-  // For the FIRST payment, we look at school_fee.
-  // For subsequent semesters (isPerSemester === true), each semester's fees
-  // must be payable again — so we key them by session+semester and only mark
-  // paid if the CURRENT semester bill has been settled.
-  const s = DB.settings; const bio = DB.biodata[user.id]||{};
-  const semKey = isPerSemester
-    ? ("semester_fee_"+(s.session||"").replace(/\W+/g,"_")+"_"+((bio.semester||"HARMATTAN").toLowerCase()))
-    : "school_fee";
-  const alreadyPaid = (typeof hasPaid==="function") && hasPaid(user.id, semKey);
-  const title = isPerSemester ? "Semester Fees — Payment List" : "School Fees — Payment List";
-  const payLabel = isPerSemester ? "Semester Fees" : "School Fees";
+  // Always use the same key that the blocking system uses. If the first
+  // school-fee bundle covers the current semester, this stays "school_fee";
+  // after admin changes semester it becomes a fresh semester-specific key.
+  const semKey = (typeof currentSemKeyFor==="function") ? currentSemKeyFor(user) : "school_fee";
+  const alreadyPaid = (typeof isCurrentSemesterPaid==="function") ? isCurrentSemesterPaid(user) : ((typeof hasPaid==="function") && hasPaid(user.id, semKey));
+  const title = semKey==="school_fee" ? "School Fees — Payment List" : "Semester Fees — Payment List";
+  const payLabel = semKey==="school_fee" ? "School Fees" : "Semester Fees";
   const old = document.getElementById("schoolFeeModal"); if(old) old.remove();
   const m = document.createElement("div");
   m.id = "schoolFeeModal";
@@ -1503,7 +1586,7 @@ function openSchoolFeePopup(user){
         <strong style="color:#15532a">📢 School Fees Payment Notice</strong>
         <div class="sub" style="color:#15532a;font-size:12px;margin-top:4px">
           You have <strong>${daysLeft} day${daysLeft===1?'':'s'}</strong> left to pay your ${payLabel.toLowerCase()} (deadline: <strong>${new Date(lateDeadline).toLocaleDateString()}</strong>).
-          If not paid by then, a <strong>₦10,000 late payment charge</strong> will be added and your ${payLabel.toLowerCase()} button will be locked until the charge is cleared.
+          If not paid by then, a <strong>₦15,000 late payment charge</strong> will be added and your ${payLabel.toLowerCase()} button will be locked until the charge is cleared.
         </div>
       </div>` : ``)}
     </div>`;
@@ -1530,6 +1613,7 @@ function openSchoolFeePopup(user){
 function printPaymentList(user){
   const { fees, total, session, bank } = paymentListFor(user);
   const bio = DB.biodata[user.id]||{};
+  const _activeSem = (DB.settings.currentSemester || bio.semester || "HARMATTAN").toString().toUpperCase();
   const body = _printHeaderHTML("PERSONAL DATA REGISTRATION CLEARANCE FORM", bio.passport||user.profile?.passport) + `
     <p style="font-size:12px;color:#666">Campus 2, Adegoke Lane, Arigbabola, Ondo City · RC: 1472598</p>
     <h2>PERSONAL DATA</h2>
@@ -1541,7 +1625,7 @@ function printPaymentList(user){
       <div class="row"><span class="k">Programme</span><span>${_progLabel(user.level)}</span></div>
       <div class="row"><span class="k">Faculty</span><span>${(bio.faculty||user.faculty||"—").toUpperCase()}</span></div>
       <div class="row"><span class="k">Department</span><span>${(bio.department||user.course||"—").toUpperCase()}</span></div>
-      <div class="row"><span class="k">Semester</span><span>${(bio.semester||"HARMATTAN").toUpperCase()}</span></div>
+      <div class="row"><span class="k">Semester</span><span>${_activeSem}</span></div>
       <div class="row"><span class="k">Academic Session</span><span>${session}</span></div>
       <div class="row"><span class="k">State Of Origin</span><span>${(bio.state||"—").toUpperCase()}</span></div>
     </div>
@@ -1552,7 +1636,7 @@ function printPaymentList(user){
       <tr><td colspan="2" style="text-align:right;font-weight:700">TOTAL</td><td style="text-align:right;font-weight:700">₦${total.toLocaleString()}:00K</td></tr>
     </table>
     <p style="font-size:12px;margin-top:10px">DEADLINE: THURSDAY 30TH APRIL, ${session.split("/")[1]}<br/>
-    LATE PAYMENT ₦10,000 APPLIES 1 WEEK 3 DAYS AFTER ACCEPTANCE FEE, ${session.split("/")[1]}<br/>
+    LATE PAYMENT ₦15,000 APPLIES 30 DAYS AFTER ACCEPTANCE FEE, ${session.split("/")[1]}<br/>
     ALL PAYMENT SHOULD BE MADE TO THE POLYTECHNIC'S BANK ACCOUNT BELOW<br/>
     THIS PAYMENT LIST MUST BE SIGNED AND STAMPED BY THE SCHOOL BURSAR ON THE PHYSICAL SCREENING DAY.<br/>
     ACCOUNT NAME: ${bank.accountName} · ACCOUNT NO: ${bank.accountNumber} · BANK: ${bank.bankName}</p>`;
@@ -1572,7 +1656,7 @@ function printBioData(user, bio){
       ${row("Course", user.course || bio.course)}
       ${row("Level", user.level || bio.level)}
       ${row("Programme", _progShort(user.level||bio.level))}
-      ${row("Semester", bio.semester)}
+      ${row("Semester", (DB.settings.currentSemester || bio.semester || "HARMATTAN").toString().toUpperCase())}
       ${row("Session", DB.settings.session)}
     </div>
     <h2>Personal</h2>
@@ -1641,7 +1725,7 @@ function printCourseForm(user, regs){
   const dept    = (bio.department || user.course || "—").toUpperCase();
   const faculty = (bio.faculty || user.faculty || facultyOfProgramme(user.course) || "—").toUpperCase();
   const level   = (bio.level || user.level || "—").toUpperCase();
-  const semester= (bio.semester || "HARMATTAN").toUpperCase();
+  const semester= (DB.settings.currentSemester || bio.semester || "HARMATTAN").toString().toUpperCase();
   const session = DB.settings.session;
   const matric  = user.matric || "—";
   const rows = regs.map((r,i)=>`
@@ -1937,6 +2021,11 @@ function adminConfirmPayment(payId){
   if(i<0) return false;
   all[i].status = "paid";
   all[i].confirmedAt = Date.now();
+  if(_isSchoolPaymentLike(all[i])){
+    all[i].sessionAtPay = all[i].sessionAtPay || _currentSession();
+    all[i].semesterAtPay = all[i].semesterAtPay || _currentSemester(DB.users.find(x=>x.id===all[i].userId));
+    all[i].periodLocked = true;
+  }
   if(all[i].invoiceId){
     const inv = DB.invoices; const ii = inv.findIndex(x=>x.id===all[i].invoiceId);
     if(ii>-1){ inv[ii].status = "paid"; inv[ii].paidAt = Date.now(); DB.invoices = inv; }
@@ -1952,3 +2041,270 @@ function adminConfirmPayment(payId){
   }
   return true;
 }
+
+
+// Backfill missing FT/PT mode on previously-imported returning students so
+// their semester fees compute correctly without needing a re-import.
+(function backfillReturningStudentMode(){
+  try{
+    if(typeof DB === "undefined" || !DB || !Array.isArray(DB.users)) return;
+    let changed = false;
+    for(const u of DB.users){
+      if(u && u.role === "returning"){
+        const current = (u.mode || u.profile?.mode || "").toString();
+        if(!current){
+          const matric = (u.matric||"").toString();
+          const level  = (u.level||"").toString();
+          const inferred = (/\bPT\b/i.test(matric) || /^PT[-\s]/i.test(level))
+            ? "Part-Time" : "Full-Time";
+          u.mode = inferred;
+          u.profile = u.profile || {};
+          if(!u.profile.mode) u.profile.mode = inferred;
+          changed = true;
+        }
+      }
+    }
+    if(changed) DB.users = DB.users;
+  }catch(_){}
+})();
+
+
+// ========================================================
+// DEBTORS / SEMESTER BLOCKING SYSTEM
+// --------------------------------------------------------
+// Real-school rule: a student who has not paid the CURRENT session/semester
+// fee is a debtor. When admin flips the semester (or advances to a new
+// session), unpaid students are snapshotted into DB.debtorsLedger so the
+// debt survives the rollover. Debtors are BLOCKED from course registration
+// and printing dockets until they clear the owed semester.
+// Public API (used by dashboard.html / courses.html / admin.html):
+//   currentSemKeyFor(user)
+//   isCurrentSemesterPaid(user)
+//   owingAmount(user)
+//   owingBannerHTML(user)
+//   getDebtors({mode,session,semester,status,q})
+//   advanceSemester()      -> snapshots debtors + flips HARMATTAN<->RAIN
+//   markDebtorPaid(entryId)
+// ========================================================
+function _isFreshBundleForUser(user){
+  // Fresh full-time / part-time student who has NOT yet paid the initial
+  // "school_fee" bundle: they owe the FULL fresh bundle, not per-semester.
+  try{
+    if(!user) return false;
+    if(user.role==="applicant"||user.role==="applicant_screening") return false;
+    return !hasPaid(user.id, "school_fee");
+  }catch(_){ return false; }
+}
+function currentSemKeyFor(user){
+  try{
+    const session = _currentSession();
+    const sem = _currentSemester(user);
+    // Returning students always pay per-semester.
+    if(user.role==="returning"){
+      return _semesterFeeKey(session, sem);
+    }
+    // Fresh (FT/PT) students: the initial "school_fee" bundle covers the
+    // session+semester in which it was paid. Only from the NEXT semester
+    // onward do they pay per-semester fees like a returning student.
+    const firstSchoolPaid = (DB.payments||[]).some(p=>p.userId===user.id && _isInitialSchoolFeePayment(p) && p.status==="paid");
+    if(firstSchoolPaid){
+      if(_schoolFeeBundleCoversCurrent(user)){
+        return "school_fee"; // current period is still covered by the bundle
+      }
+      return _semesterFeeKey(session, sem);
+    }
+    return "school_fee";
+  }catch(_){ return "school_fee"; }
+}
+function _feeableRoles(){ return ["fresh","returning"]; }
+function isSemesterDebtLockActive(){
+  return !!((DB.settings||{}).semesterDebtLockActive);
+}
+function isCurrentSemesterPaid(user){
+  try{
+    if(!user || !_feeableRoles().includes(user.role)) return true;
+    const key = currentSemKeyFor(user);
+    return hasPaid(user.id, key) || _hasPaidForCurrentPeriod(user) || (key==="school_fee" && _schoolFeeBundleCoversCurrent(user));
+  }catch(_){ return true; }
+}
+function shouldBlockForFees(user){
+  try{ return isSemesterDebtLockActive() && !isCurrentSemesterPaid(user); }
+  catch(_){ return false; }
+}
+function owingAmount(user){
+  try{
+    if(!user || !_feeableRoles().includes(user.role)) return 0;
+    if(isCurrentSemesterPaid(user)) return 0;
+    const info = paymentListFor(user);
+    return info && info.total ? info.total : 0;
+  }catch(_){ return 0; }
+}
+function owingBannerHTML(user){
+  if(!shouldBlockForFees(user)) return "";
+  const amt = owingAmount(user);
+  if(!amt) return "";
+  const s = DB.settings||{};
+  const bio = (DB.biodata||{})[user.id]||{};
+  const sem = (s.currentSemester || bio.semester || "HARMATTAN").toString().toUpperCase();
+  return `<section class="panel" style="border:2px solid #b91c1c;background:#fff1f1">
+    <h2 style="margin:0 0 6px;color:#b91c1c">🚫 OWING ₦${amt.toLocaleString()}</h2>
+    <p style="margin:0;color:#7a1010;font-size:14px;line-height:1.55">
+      You have <strong>not paid</strong> the ${sem} semester (${s.session||""}) fee.
+      Your account is <strong>blocked</strong> from course registration and printing
+      the course docket until this debt is cleared. Clear the fee below to
+      restore full access.
+    </p>
+    <div style="margin-top:10px">
+      <button class="btn btn-green" onclick="openSchoolFeePopup(Auth.current())">💰 Pay Now (₦${amt.toLocaleString()})</button>
+    </div>
+  </section>`;
+}
+
+// -------- Debtors ledger --------
+function _snapshotDebtorsForRollover(fromSession, fromSemester){
+  const ledger = DB.debtorsLedger || [];
+  const users = DB.users || [];
+  const already = new Set(ledger.filter(x=>x.session===fromSession && x.semester===fromSemester).map(x=>x.userId));
+  let added = 0;
+  for(const u of users){
+    if(!_feeableRoles().includes(u.role)) continue;
+    if(already.has(u.id)) continue;
+    if(isCurrentSemesterPaid(u)) continue;
+    const amt = owingAmount(u);
+    if(amt<=0) continue;
+    ledger.push({
+      id: "deb_"+Date.now().toString(36)+"_"+Math.random().toString(36).slice(2,6),
+      userId: u.id,
+      name: u.name || "",
+      matric: u.matric || "",
+      email: u.email || "",
+      role: u.role,
+      mode: /part/i.test(u.mode||u.profile?.mode||"") ? "Part-Time" : "Full-Time",
+      course: u.course || "",
+      level:  u.level  || "",
+      session: fromSession,
+      semester: fromSemester,
+      semKey: currentSemKeyFor(u),
+      amount: amt,
+      status: "owing",
+      createdAt: Date.now(),
+    });
+    added++;
+  }
+  DB.debtorsLedger = ledger;
+  return added;
+}
+function getDebtors(filter){
+  filter = filter||{};
+  const ledger = (DB.debtorsLedger||[]).slice();
+  // Also surface CURRENT-semester debtors (not yet snapshotted) so admin
+  // sees who's owing right now, in real time.
+  const cur = DB.settings||{};
+  const curSession  = cur.session || "";
+  const curSemester = (cur.currentSemester||"HARMATTAN").toUpperCase();
+  const seen = new Set(ledger.filter(x=>x.status==="owing" && x.session===curSession && x.semester===curSemester).map(x=>x.userId));
+  for(const u of (DB.users||[])){
+    if(!_feeableRoles().includes(u.role)) continue;
+    if(seen.has(u.id)) continue;
+    if(isCurrentSemesterPaid(u)) continue;
+    const amt = owingAmount(u);
+    if(amt<=0) continue;
+    ledger.push({
+      id: "live_"+u.id,
+      userId: u.id,
+      name: u.name || "",
+      matric: u.matric || "",
+      email: u.email || "",
+      role: u.role,
+      mode: /part/i.test(u.mode||u.profile?.mode||"") ? "Part-Time" : "Full-Time",
+      course: u.course || "",
+      level:  u.level  || "",
+      session: curSession,
+      semester: curSemester,
+      semKey: currentSemKeyFor(u),
+      amount: amt,
+      status: "owing",
+      live: true,
+      createdAt: Date.now(),
+    });
+  }
+  return ledger.filter(r=>{
+    if(filter.mode && filter.mode!=="all" && r.mode!==filter.mode) return false;
+    if(filter.role && filter.role!=="all" && r.role!==filter.role) return false;
+    if(filter.session && filter.session!=="all" && r.session!==filter.session) return false;
+    if(filter.semester && filter.semester!=="all" && r.semester!==filter.semester) return false;
+    if(filter.status && filter.status!=="all" && r.status!==filter.status) return false;
+    if(filter.q){
+      const q = filter.q.toLowerCase();
+      const hay = (r.name+" "+r.matric+" "+r.email+" "+r.course).toLowerCase();
+      if(!hay.includes(q)) return false;
+    }
+    return true;
+  }).sort((a,b)=>(b.createdAt||0)-(a.createdAt||0));
+}
+function markDebtorPaid(entryId){
+  const ledger = DB.debtorsLedger||[];
+  const i = ledger.findIndex(x=>x.id===entryId);
+  if(i<0) return false;
+  ledger[i].status = "paid";
+  ledger[i].paidAt = Date.now();
+  DB.debtorsLedger = ledger;
+  return true;
+}
+function advanceSemester(){
+  const s = DB.settings || {};
+  const curSession  = s.session || "";
+  const curSemester = (s.currentSemester||"HARMATTAN").toUpperCase();
+  const added = _snapshotDebtorsForRollover(curSession, curSemester);
+  let nextSession = curSession, nextSemester;
+  if(curSemester==="HARMATTAN"){
+    nextSemester = "RAIN";
+  } else {
+    nextSemester = "HARMATTAN";
+    // Roll session forward: 2026/2027 -> 2027/2028
+    const m = /^(\d{4})\/(\d{4})$/.exec(curSession);
+    if(m){ nextSession = (parseInt(m[1],10)+1)+"/"+(parseInt(m[2],10)+1); }
+  }
+  DB.settings = {...s, session: nextSession, currentSemester: nextSemester, previousSession: curSession, previousSemester: curSemester, semesterOpenedAt: Date.now(), semesterDebtLockActive: true};
+  return { added, from:{session:curSession,semester:curSemester}, to:{session:nextSession,semester:nextSemester} };
+}
+
+// One-time migration: stamp legacy "school_fee" payments (made before we
+// started recording sessionAtPay/semesterAtPay) with the current session and
+// semester. This way previously-paid fresh students are considered covered
+// for the CURRENT period only — as soon as the admin flips to the next
+// semester, they show as owing (pending) and get billed per-semester like
+// returning students.
+(function _migrateStampLegacySchoolFeePayments(){
+  try{
+    const s = DB.settings || {};
+    const ses = s.session || "";
+    const sem = (s.currentSemester || "HARMATTAN").toUpperCase();
+    if(!ses) return;
+    const payments = DB.payments || [];
+    let changed = false;
+    for(const p of payments){
+      const badLegacyRainStamp = p && !p.periodLocked && _isInitialSchoolFeePayment(p) && p.semesterAtPay==="RAIN" && sem==="RAIN" && !s.semesterOpenedAt;
+      const badLegacyCurrentHarmattanStamp = p && !p.periodLocked && _isInitialSchoolFeePayment(p) && sem==="HARMATTAN" && _normSemester(p.semesterAtPay)!=="HARMATTAN";
+      if(p && _isSchoolPaymentLike(p) && p.status==="paid" && (!p.sessionAtPay || badLegacyRainStamp || badLegacyCurrentHarmattanStamp)){
+        const anchor = p.confirmedAt || p.paidAt || p.date || p.createdAt || 0;
+        let stampSession = ses;
+        let stampSemester = sem;
+        if(s.semesterOpenedAt && anchor && anchor < s.semesterOpenedAt && s.previousSession && s.previousSemester){
+          stampSession = s.previousSession;
+          stampSemester = s.previousSemester;
+        } else if(!s.semesterOpenedAt && sem==="RAIN") {
+          // If an older ZIP is installed after the admin has already opened
+          // 2nd semester, unstamped legacy school-fee payments are first-
+          // semester payments and must not unlock the new RAIN bill.
+          stampSemester = "HARMATTAN";
+        }
+        p.sessionAtPay = stampSession;
+        p.semesterAtPay = _normSemester(stampSemester);
+        p.periodLocked = true;
+        changed = true;
+      }
+    }
+    if(changed) DB.payments = payments;
+  }catch(_){}
+})();
