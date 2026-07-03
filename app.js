@@ -1418,18 +1418,18 @@ function paymentListFor(user){
   // Only AFTER admin moves to another semester/session does a fresh student
   // switch to the reduced "per-semester" list:
   //   - PART-TIME: TUITION + EXAM FEE
-  //   - FULL-TIME: EXAM FEE only
+  //   - FULL-TIME: TUITION FEE only
   const firstPaid = (DB.payments||[]).some(p=>p.userId===user.id && p.status==="paid" && _isInitialSchoolFeePayment(p));
   const firstBundleCoversNow = (typeof _schoolFeeBundleCoversCurrent === "function") && _schoolFeeBundleCoversCurrent(user);
   // Returning students never see the full fresh-student payment list — they only
   // pay per-semester fees (Tuition+Exam for PT, Exam only for FT).
-  const isReturning = (user.role === "returning") || (firstPaid && !firstBundleCoversNow);
+  const isReturning = (user.role === "returning") || firstPaid;
   let fees, isPerSemester = false;
   if(isReturning){
     isPerSemester = true;
     fees = isPartTime
       ? [ [tuitionLabel, tuition], ["EXAM FEE", examFee] ]
-      : [ ["EXAM FEE", examFee] ];
+      : [ [tuitionLabel, tuition] ];
   } else {
     fees = [
       ["FILING",                4000],
@@ -1760,7 +1760,7 @@ function printCourseForm(user, regs){
       .ocp-field{font-size:16px;margin:6px 0;display:flex;align-items:baseline;gap:8px}
       .ocp-field b{min-width:130px;text-transform:uppercase;letter-spacing:.5px}
       .ocp-field .val{font-weight:700;border-bottom:1.5px dotted #222;flex:1;padding:0 6px 2px}
-      .ocp-passport{position:absolute;right:0;top:150px;width:120px;height:150px;border:1px solid #333;background:#eee}
+      .ocp-passport{position:absolute;right:0;top:0;width:110px;height:130px;border:1px solid #333;background:#eee}
       .ocp-passport img{width:100%;height:100%;object-fit:cover}
       table.ocp-tbl{width:100%;border-collapse:collapse;font-size:12px;margin-top:10px}
       table.ocp-tbl th,table.ocp-tbl td{border:1px solid #222;padding:8px}
@@ -2128,8 +2128,8 @@ function isCurrentSemesterPaid(user){
   }catch(_){ return true; }
 }
 function shouldBlockForFees(user){
-  try{ return isSemesterDebtLockActive() && !isCurrentSemesterPaid(user); }
-  catch(_){ return false; }
+  // Blocking removed per admin decision. Suspension is handled via admin panel.
+  return false;
 }
 function owingAmount(user){
   try{
@@ -2140,6 +2140,8 @@ function owingAmount(user){
   }catch(_){ return 0; }
 }
 function owingBannerHTML(user){
+  // Blocking banner removed. Suspension is used instead.
+  return "";
   if(!shouldBlockForFees(user)) return "";
   const amt = owingAmount(user);
   if(!amt) return "";
