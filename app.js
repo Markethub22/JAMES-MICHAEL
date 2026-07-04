@@ -606,10 +606,8 @@ async function adminApproveScreening(scrId){
   let user = users.find(u=>u.profile && u.profile.scrId===s.id);
   // If two applicants happen to share an email, keep their accounts distinct.
   const emailLc = (s.email||"").toLowerCase();
-  if(!user && emailLc && users.some(u=>(u.email||"").toLowerCase()===emailLc)){
-    const at = s.email.indexOf("@");
-    s.email = at>0 ? s.email.slice(0,at)+"+"+String(s.id).toLowerCase().replace(/[^a-z0-9]+/g,"")+s.email.slice(at) : s.email;
-  }
+  // NOTE: emails are kept as-is even if two applicants share one; do NOT
+  // inject the screening id into the address (it looked like "+scr..." spam).
   const firstName = ((s.name||s.firstName||"student").trim().split(/\s+/)[0]||"student").toLowerCase();
   if(!user){
     user = {
@@ -809,22 +807,15 @@ function _schoolFeeBundleCoversCurrent(user){
   const session = _currentSession();
   const semester = _currentSemester(user);
   const openedAt = (DB.settings||{}).semesterOpenedAt || 0;
-  return (DB.payments||[]).some(p =>
-    p.userId===user.id && _isInitialSchoolFeePayment(p) && p.status==="paid" &&
-    (
-      _paymentPeriodMatches(p, session, semester) ||
-      // The initial "school_fee" bundle a fresh student pays covers the
-      // ENTIRE session (both HARMATTAN and RAIN). So as long as the payment
-      // was stamped with the current session, the student is still covered
-      // even after the admin flips HARMATTAN -> RAIN within the same session.
-      (_normSession(p.sessionAtPay||"") && _normSession(p.sessionAtPay||"")===_normSession(session)) ||
-      // Legacy fallback: if the admin hasn't rolled the semester (no
-      // semesterOpenedAt), or this payment was made in/after the current
-      // period, the initial school-fee bundle still covers the current period.
-      !openedAt ||
-      (p.confirmedAt || p.paidAt || p.date || 0) >= openedAt
-    )
-  );
+  return (DB.payments||[]).some(p => {
+    if(p.userId!==user.id || !_isInitialSchoolFeePayment(p) || p.status!=="paid") return false;
+    // Exact match on stamped session + semester covers the current period.
+    if(_paymentPeriodMatches(p, session, semester)) return true;
+    // Legacy fallback: if the admin has NEVER opened a new semester, the
+    // initial payment still covers the (first) current period.
+    if(!openedAt) return true;
+    return false;
+  });
 }
 
 function userPayments(userId){ return DB.payments.filter(p=>p.userId===userId); }
@@ -1423,7 +1414,7 @@ function paymentListFor(user){
   const firstBundleCoversNow = (typeof _schoolFeeBundleCoversCurrent === "function") && _schoolFeeBundleCoversCurrent(user);
   // Returning students never see the full fresh-student payment list — they only
   // pay per-semester fees (Tuition+Exam for PT, Exam only for FT).
-  const isReturning = (user.role === "returning") || firstPaid;
+  const isReturning = (user.role === "returning") || (firstPaid && !firstBundleCoversNow);
   let fees, isPerSemester = false;
   if(isReturning){
     isPerSemester = true;
@@ -1488,7 +1479,7 @@ function schoolFeeTotal(user){
   try { return paymentListFor(user).total; } catch(e){ return 0; }
 }
 
-// Notice banner shown on student dashboards so they know about the 10-day
+// Notice banner shown on student dashboards so they know about the 30-day
 // grace period before the ₦15,000 late payment charge locks school fees.
 function lateFeeNoticeHTML(user){
   try{
@@ -1504,7 +1495,7 @@ function lateFeeNoticeHTML(user){
       return `<section class="panel" style="border:1px solid #f5c26b;background:#fff8e6">
         <h3 style="margin:0 0 6px;color:#8a5a00">⚠ Late Payment Charge Applied</h3>
         <p class="sub" style="color:#8a5a00;margin:0">
-          Your 10-day window to pay ${payLabel.toLowerCase()} has expired. A
+          Your 30-day window to pay ${payLabel.toLowerCase()} has expired. A
           <strong>₦15,000 late payment charge</strong> has been added and your
           ${payLabel.toLowerCase()} button is <strong>locked</strong> until this charge is cleared.
           ${latePaid?'<br/><strong>Late charge paid ✓ — you can now pay your '+payLabel.toLowerCase()+'.</strong>':''}
@@ -1570,7 +1561,7 @@ function openSchoolFeePopup(user){
         <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap">
           <div>
             <strong style="color:#8a5a00">Late Payment Charge ${latePaid?'':'(Pay First)'}</strong>
-            <div class="sub" style="color:#8a5a00;font-size:12px">Applies because school fees are still outstanding more than 10 days after acceptance. Must be cleared before school fees.</div>
+            <div class="sub" style="color:#8a5a00;font-size:12px">Applies because school fees are still outstanding more than 30 days after acceptance. Must be cleared before school fees.</div>
           </div>
           <div style="font-weight:700;color:#8a5a00">₦${lateCharge.toLocaleString()}</div>
         </div>

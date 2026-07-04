@@ -38,9 +38,26 @@ const gate = document.getElementById("gate");
 const wrap = document.getElementById("wrap");
 if(me){
   // HARD GATE: unpaid students see the owing banner and cannot open the list.
-  if(typeof shouldBlockForFees==="function" && shouldBlockForFees(me)){
-    gate.innerHTML = (typeof owingBannerHTML==="function" ? owingBannerHTML(me) : "")
-      + `<p style="margin-top:10px"><a class="btn btn-ghost" href="dashboard.html">← Back to Dashboard</a></p>`;
+  // GATE: block course registration when the current semester's school fee
+  // is still unpaid (defaulter). Clean minimal notice — no big red banner.
+  const _unpaid = (typeof isCurrentSemesterPaid === "function") && !isCurrentSemesterPaid(me);
+  if(_unpaid){
+    const _info = (typeof paymentListFor==="function") ? paymentListFor(me) : {total:0,lateCharge:0};
+    const _amt = _info.total||0;
+    const _late = _info.lateCharge||0;
+    gate.innerHTML = `
+      <section class="panel" style="border:1px solid #f5c26b;background:#fff8e6">
+        <h3 style="margin:0 0 6px;color:#8a5a00">🔒 Course Registration Locked</h3>
+        <p class="sub" style="color:#8a5a00;margin:0 0 10px">
+          You have not paid your school fees for the current semester.
+          ${_late>0 ? `A <strong>₦${_late.toLocaleString()} late payment charge</strong> has also been added and must be cleared first.` : ``}
+          Clear your fees to unlock course registration.
+        </p>
+        <div style="display:flex;gap:8px;flex-wrap:wrap">
+          <button class="btn btn-green" onclick="openSchoolFeePopup(Auth.current())">💰 Pay Now${_amt?` (₦${_amt.toLocaleString()})`:``}</button>
+          <a class="btn btn-ghost" href="dashboard.html">← Back to Dashboard</a>
+        </div>
+      </section>`;
   } else {
   gate.innerHTML = `<span class="status-pill status-paid">Open</span> &nbsp; Session ${DB.settings.session}`;
   wrap.style.display="block";
